@@ -1,9 +1,8 @@
 // WhatsApp Business Profile Manager (Cloudflare Worker)
-// - UI served as HTML string (never runs in Worker runtime)
-// - Require "Load Profile" first
-// - Save shows confirm modal with diffs; user can cancel
-// - Only non-empty, changed fields are POSTed (no blank overwrites)
-// - Optional photo upload via resumable upload (requires env.APP_ID)
+// - View & update WhatsApp Business Profile (Cloud API)
+// - PNG/JPG profile photo via Postman 3-step upload flow
+// - Only non-empty changed fields are sent on update
+// - UI: load-first, confirm modal, website pills editor
 
 const GRAPH_VERSION = "v23.0";
 const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
@@ -27,7 +26,7 @@ export default {
       });
     }
 
-    // ===== API: Get current profile (explicit fields + normalize) =====
+    // ---- API: GET profile ----
     if (pathname === "/api/profile" && request.method === "GET") {
       const token = request.headers.get("x-wa-access-token");
       const phoneId = request.headers.get("x-wa-phone-number-id");
@@ -59,7 +58,7 @@ export default {
       return cors(json({ status: resp.status, data, raw }, resp.ok ? 200 : resp.status));
     }
 
-    // ===== API: Update profile (only non-empty keys) =====
+    // ---- API: POST profile (only non-empty keys) ----
     if (pathname === "/api/profile" && request.method === "POST") {
       const token = request.headers.get("x-wa-access-token");
       const phoneId = request.headers.get("x-wa-phone-number-id");
@@ -68,10 +67,8 @@ export default {
       }
 
       const bodyIn = await safeBody(request);
-
-      // include only non-empty keys to avoid blank overwrites
       const includeIfValue = (v) => {
-        if (v === null || v === undefined) return false;
+        if (v == null) return false;
         if (Array.isArray(v)) return v.length > 0;
         if (typeof v === "string") return v.trim().length > 0;
         return true;
@@ -82,11 +79,11 @@ export default {
         if (includeIfValue(bodyIn[key])) payload[key] = bodyIn[key];
       }
       if (Array.isArray(bodyIn.websites) && bodyIn.websites.length > 0) {
-        payload.websites = bodyIn.websites.slice(0, 2); // Meta limit
+        payload.websites = bodyIn.websites.slice(0, 2); // max 2 per Meta
       }
 
       if (Object.keys(payload).length === 1) {
-        return cors(json({ status: 400, error: "No non-empty fields to update." }, 400));
+        return cors(json({ error: "No non-empty fields to update." }, 400));
       }
 
       const resp = await fetch(`${GRAPH}/${encodeURIComponent(phoneId)}/whatsapp_business_profile`, {
@@ -101,94 +98,98 @@ export default {
       return cors(json({ status: resp.status, data }, resp.ok ? 200 : resp.status));
     }
 
-    // ===== API: Upload & apply profile photo (requires env.APP_ID) =====
+    // ---- API: POST photo (Postman 3-step flow; JPG/PNG) ----
     if (pathname === "/api/photo" && request.method === "POST") {
       const token = request.headers.get("x-wa-access-token");
       const phoneId = request.headers.get("x-wa-phone-number-id");
       if (!token || !phoneId) return cors(json({ error: "Missing x-wa-access-token or x-wa-phone-number-id" }, 400));
       if (!env.APP_ID) return cors(json({ error: "APP_ID not configured in worker env" }, 400));
 
-      const ct = request.headers.get("content-type") || "";
-      let fileBytes, mime = "image/jpeg", fileLength;
+      const allowedTypes = ["image/jpeg", "image/jpg", "image/png"];
+      const ct = (request.headers.get("content-type") || "").toLowerCase();
+      let fileBytes, fileLength, mime;
 
+      // 0) Accept file or image_url
       if (ct.includes("multipart/form-data")) {
         const form = await request.formData();
         const file = form.get("file");
-        if (!file || typeof file === "string") {
-          return cors(json({ error: "multipart/form-data must include a 'file' field" }, 400));
-        }
-        mime = file.type || "image/jpeg";
+        if (!file || typeof file === "string") return cors(json({ error: "multipart/form-data must include a 'file' field" }, 400));
+        const t = (file.type || "").toLowerCase();
+        if (!allowedTypes.includes(t)) return cors(json({ error: "Please upload a JPG or PNG image" }, 415));
+        mime = t;
         fileBytes = new Uint8Array(await file.arrayBuffer());
         fileLength = fileBytes.length;
       } else {
         const body = await safeBody(request);
-        if (!body || !body.image_url) {
-          return cors(json({ error: "Send multipart 'file' OR JSON {image_url}" }, 400));
-        }
-        const fileResp = await fetch(body.image_url);
-        if (!fileResp.ok) {
-          return cors(json({ error: `Failed to fetch image_url: ${fileResp.status}` }, 400));
-        }
-        mime = fileResp.headers.get("content-type") || "image/jpeg";
-        fileBytes = new Uint8Array(await fileResp.arrayBuffer());
+        if (!body?.image_url) return cors(json({ error: "Send multipart 'file' OR JSON {image_url}" }, 400));
+        let u;
+        try { u = new URL(body.image_url); } catch { return cors(json({ error: "Invalid image_url" }, 400)); }
+        if (u.protocol !== "https:") return cors(json({ error: "image_url must be https" }, 400));
+        const r = await fetch(body.image_url);
+        if (!r.ok) return cors(json({ error: `Failed to fetch image_url: ${r.status}` }, 400));
+        const t = (r.headers.get("content-type") || "").toLowerCase();
+        if (!t.startsWith("image/") || !allowedTypes.includes(t)) return cors(json({ error: "Please use JPG or PNG" }, 415));
+        mime = t;
+        fileBytes = new Uint8Array(await r.arrayBuffer());
         fileLength = fileBytes.length;
       }
 
-      // Create upload session
-      const createUpload = await fetch(
+      // Step 1 — unchanged above this point...
+      const create = await fetch(
         `${GRAPH}/${encodeURIComponent(env.APP_ID)}/uploads?file_length=${fileLength}&file_type=${encodeURIComponent(mime)}`,
         { method: "POST", headers: { Authorization: `Bearer ${token}` } }
       );
-      const createJson = await safeJson(createUpload);
-      if (!createUpload.ok) {
-        return cors(json({ step: "create_upload", error: createJson }, createUpload.status));
-      }
-      const uploadId = createJson.id;
+      const createJson = await safeJson(create);
+      if (!create.ok) return cors(json({ step: "create_upload", error: createJson }, create.status));
 
-      // Upload bytes
-      const uploadBytes = await fetch(`${GRAPH}/${encodeURIComponent(uploadId)}`, {
+      const rawId = createJson.id; // e.g. "upload:MTphdHRhY2htZW50...?...sig=ARZ..."
+      if (!rawId || typeof rawId !== "string") {
+        return cors(json({ step: "create_upload", error: "No id (UPLOAD_ID) in response", createJson }, 502));
+      }
+
+      // ✅ Step 2 — use the RAW id exactly as returned, no encoding of "upload:" or the "?sig=..."
+      const step2Url = `${GRAPH}/${rawId}`; // <-- IMPORTANT: no encodeURIComponent here
+
+      const bytesResp = await fetch(step2Url, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${token}`, // OAuth2 Bearer, as in your Postman flow
           "file_offset": "0",
           "Content-Type": "application/octet-stream",
+          "Content-Length": String(fileBytes.length),
         },
         body: fileBytes,
       });
-      const uploadJson = await safeJson(uploadBytes);
-      if (!uploadBytes.ok) {
-        return cors(json({ step: "upload_bytes", error: uploadJson }, uploadBytes.status));
-      }
+      const bytesJson = await safeJson(bytesResp);
+      if (!bytesResp.ok) return cors(json({ step: "upload_bytes", error: bytesJson, step2Url }, bytesResp.status));
 
-      const handle = uploadJson.h || uploadJson.handle || (uploadJson.data && uploadJson.data[0] && uploadJson.data[0].h);
+      // Extract handle (h)
+      const handle =
+        bytesJson.h ||
+        bytesJson.handle ||
+        (bytesJson.data && (bytesJson.data[0]?.h || bytesJson.data.handle)) ||
+        bytesJson.profile_picture_handle;
+
       if (!handle) {
-        return cors(json({ step: "upload_bytes", error: "No handle returned" }, 502));
+        return cors(json({ step: "upload_bytes", error: "No handle (h) in response", bytesJson }, 502));
       }
 
-      // Apply to profile
-      const applyResp = await fetch(`${GRAPH}/${encodeURIComponent(phoneId)}/whatsapp_business_profile`, {
+      // Step 3 — unchanged
+      const apply = await fetch(`${GRAPH}/${encodeURIComponent(phoneId)}/whatsapp_business_profile`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ messaging_product: "whatsapp", profile_picture_handle: handle }),
       });
-      const applyJson = await safeJson(applyResp);
+      const applyJson = await safeJson(apply);
 
-      return cors(json({
-        status: applyResp.status,
-        upload_id: uploadId,
-        handle,
-        apply: applyJson,
-      }, applyResp.ok ? 200 : applyResp.status));
+      return cors(json({ status: apply.status, upload_id: rawId, handle, apply: applyJson }, apply.ok ? 200 : apply.status));
     }
 
     return cors(json({ error: "Not Found" }, 404));
   }
 };
 
-// ===== helpers =====
+// ---------- helpers ----------
 async function safeJson(resp) { try { return await resp.json(); } catch { return {}; } }
 async function safeBody(req) { try { return await req.json(); } catch { return {}; } }
 function json(obj, status = 200) {
@@ -205,10 +206,9 @@ function cors(resp) {
   return new Response(resp.body, { status: resp.status, headers: h });
 }
 
-// ===== UI (served as a string) =====
+// ---------- UI ----------
 function htmlPage(photoEnabled) {
-  return (
-`<!doctype html>
+  return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
@@ -240,13 +240,8 @@ function htmlPage(photoEnabled) {
     .hr { height:1px; background:#e5e7eb; margin:10px 0; }
     .thumb { width:72px; height:72px; border-radius:10px; object-fit:cover; border:1px solid #e5e7eb; background:#f3f4f6; }
     /* Modal */
-    .overlay {
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,.45);
-      display: none;             /* default closed to block BFCache popups */
-      align-items: center; justify-content: center;
-    }
-    .overlay.open { display: flex; }
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; }
+    .overlay.open { display:flex; }
     .modal { background:#fff; color:#111827; width:min(520px, calc(100% - 32px)); border-radius:14px; border:1px solid #e5e7eb; box-shadow:0 10px 30px rgba(0,0,0,.2); }
     .modal header { padding:14px 16px; border-bottom:1px solid #e5e7eb; font-weight:700; }
     .modal .content { padding:14px 16px; max-height:60vh; overflow:auto; }
@@ -275,7 +270,7 @@ function htmlPage(photoEnabled) {
         <button id="btnLoad" class="btn soft">Load Profile</button>
         <span id="status" class="muted"></span>
       </div>
-      <div class="muted" style="margin-top:6px">Nothing is stored. Token is used only on this page and proxied to Meta via this Worker.</div>
+      <div class="muted" style="margin-top:6px">We don’t store anything. Token is used only in this session and proxied to Meta via this Worker.</div>
     </div>
 
     <div id="editor" class="box hidden">
@@ -314,6 +309,7 @@ function htmlPage(photoEnabled) {
           <input id="wsNew" type="url" placeholder="https://example.com" style="flex:1" disabled/>
           <button id="wsAdd" class="btn soft" type="button" disabled>Add</button>
         </div>
+        <div class="muted" style="margin-top:6px">Tip: Click a website pill to edit. Shift-click or right-click a pill to remove.</div>
       </div>
 
       <div class="hr"></div>
@@ -333,12 +329,12 @@ function htmlPage(photoEnabled) {
       <h2>Profile Photo</h2>
       <div class="flex">
         <img id="thumb" class="thumb" alt="Current" src="" onerror="this.style.visibility='hidden'"/>
-        <div class="muted">JPEG works best. We'll create a resumable upload, get a handle, and apply it.</div>
+        <div class="muted">JPG or PNG. We’ll create an upload session, send bytes, then apply the handle.</div>
       </div>
       <div class="flex" style="margin-top:10px">
         <input id="file" type="file" accept="image/jpeg,image/jpg,image/png" disabled/>
         <span class="muted">or</span>
-        <input id="imgUrl" type="url" placeholder="https://.../logo.jpg" style="flex:1" disabled/>
+        <input id="imgUrl" type="url" placeholder="https://.../logo.png" style="flex:1" disabled/>
       </div>
       <div class="flex" style="margin-top:10px">
         <button id="btnPhoto" class="btn soft" disabled>Upload & Apply</button>
@@ -366,65 +362,42 @@ function htmlPage(photoEnabled) {
   var $ = function(id){ return document.getElementById(id); };
   var state = { phoneId: "", token: "", websites: [], loaded: false, current: {} };
 
-  // --- Modal state & helpers (overlay closed by default: display:none) ---
-  var overlay = $("overlay");
-  var diffList = $("diffList");
-  var pendingPayload = null;
+  // Modal (closed by default)
+  var overlay = $("overlay"), diffList = $("diffList"), pendingPayload = null;
+  function esc(s){return String(s).replace(/[&<>\"']/g,function(m){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',\"'\":'&#039;'}[m]);});}
+  function closeConfirm(){ overlay.classList.remove("open"); overlay.style.display="none"; overlay.setAttribute("aria-hidden","true"); diffList.innerHTML=""; pendingPayload=null; }
+  function openConfirm(list){ overlay.classList.add("open"); overlay.style.display="flex"; overlay.setAttribute("aria-hidden","false"); diffList.innerHTML=list.map(function(i){ return '<div class="kv"><div class="k">'+esc(i.key)+'</div><div class="v-old mono">Old: '+esc(i.old)+'</div><div class="v-new mono">New: '+esc(i.val)+'</div></div>'; }).join(""); }
+  window.addEventListener("pageshow", function(e){ if(e.persisted) closeConfirm(); });
+  document.addEventListener("keydown", function(e){ if(e.key==="Escape") closeConfirm(); });
 
-  function closeConfirm(){
-    overlay.classList.remove("open");
-    overlay.style.display = "none";
-    overlay.setAttribute("aria-hidden","true");
-    diffList.innerHTML = "";
-    pendingPayload = null;
-  }
-  function openConfirm(list){
-    overlay.classList.add("open");
-    overlay.style.display = "flex";
-    overlay.setAttribute("aria-hidden","false");
-    diffList.innerHTML = list.map(function(i){
-      return '<div class="kv">'
-           +   '<div class="k">' + escapeHtml(i.key) + '</div>'
-           +   '<div class="v-old mono">Old: ' + escapeHtml(i.old) + '</div>'
-           +   '<div class="v-new mono">New: ' + escapeHtml(i.val) + '</div>'
-           + '</div>';
-    }).join("");
-  }
-  // Force close on load and BFCache restores; Esc closes
-  closeConfirm();
-  window.addEventListener("pageshow", function(e){ if (e.persisted) closeConfirm(); });
-  document.addEventListener("keydown", function(e){ if (e.key === "Escape") closeConfirm(); });
-
-  function toast(el, text, ok){
-    if (ok === void 0) ok = true;
-    el.textContent = text;
-    el.style.color = ok ? "#065f46" : "#b91c1c";
-    setTimeout(function(){ el.textContent=""; el.style.color="#6b7280"; }, 4000);
-  }
-
-  function enableEditing(on){
-    ["about","vertical","email","address","description","wsNew","wsAdd","btnSave","file","imgUrl","btnPhoto"]
-      .forEach(function(id){ var el=$(id); if(el) el.disabled = !on; });
-  }
+  function toast(el, text, ok){ if(ok===void 0) ok=true; el.textContent = text; el.style.color = ok ? "#065f46" : "#b91c1c"; setTimeout(function(){ el.textContent=""; el.style.color="#6b7280"; }, 4000); }
+  function enableEditing(on){ ["about","vertical","email","address","description","wsNew","wsAdd","btnSave","file","imgUrl","btnPhoto"].forEach(function(id){ var el=$(id); if(el) el.disabled = !on; }); }
 
   function renderWebsites(){
-    var container = $("websites");
-    container.innerHTML = "";
+    var c = $("websites"); c.innerHTML = "";
     (state.websites || []).forEach(function(u, idx){
       var pill = document.createElement("span");
       pill.className = "pill mono";
       pill.textContent = u;
-      pill.title = "Click to remove";
+      pill.title = "Click to edit (Shift-click or right-click to remove)";
       pill.style.cursor = "pointer";
-      pill.onclick = function(){ state.websites.splice(idx,1); renderWebsites(); };
-      container.appendChild(pill);
+      pill.onclick = function(){
+        var v = prompt("Edit website URL:", state.websites[idx] || "");
+        if (!v) return;
+        try { new URL(v); } catch(e) { toast($("saveMsg"), "Invalid URL", false); return; }
+        state.websites[idx] = v;
+        renderWebsites();
+      };
+      pill.onauxclick = function(e){ e.preventDefault(); state.websites.splice(idx,1); renderWebsites(); };
+      pill.onmousedown = function(e){ if (e.shiftKey) { e.preventDefault(); state.websites.splice(idx,1); renderWebsites(); } };
+      c.appendChild(pill);
     });
   }
 
   $("wsAdd").onclick = function(){
     var v = $("wsNew").value.trim();
     if (!v) return;
-    try { new URL(v); } catch(e){ toast($("saveMsg"), "Invalid URL", false); return; }
+    try { new URL(v); } catch(e) { toast($("saveMsg"), "Invalid URL", false); return; }
     state.websites = state.websites || [];
     if (state.websites.length >= 2) { toast($("saveMsg"), "Max 2 websites", false); return; }
     if (state.websites.indexOf(v) === -1) state.websites.push(v);
@@ -432,9 +405,7 @@ function htmlPage(photoEnabled) {
     renderWebsites();
   };
 
-  $("btnLoad").onclick = function(){ return loadProfile(); };
-
-  function loadProfile(){
+  $("btnLoad").onclick = function(){
     state.phoneId = $("phoneId").value.trim();
     state.token = $("token").value.trim();
     if (!state.phoneId || !state.token) { toast($("status"), "Enter both Phone Number ID and Access Token", false); return; }
@@ -444,14 +415,13 @@ function htmlPage(photoEnabled) {
       method: "GET",
       headers: { "x-wa-phone-number-id": state.phoneId, "x-wa-access-token": state.token }
     })
-    .then(function(resp){ return resp.json().then(function(out){ return {resp:resp, out:out}; }); })
+    .then(function(r){ return r.json().then(function(o){ return {r:r,o:o}; }); })
     .then(function(pair){
-      var resp = pair.resp, out = pair.out;
-      $("rawOut").textContent = JSON.stringify(out, null, 2);
+      var r = pair.r, o = pair.o;
+      $("rawOut").textContent = JSON.stringify(o, null, 2);
+      if (!r.ok) { toast($("status"), (o && o.error) || "Failed to load profile", false); return; }
 
-      if (!resp.ok) { toast($("status"), (out && out.error) ? out.error : "Failed to load profile", false); return; }
-
-      var p = out && out.data ? out.data : out;
+      var p = (o && o.data) ? o.data : o;
       state.current = {
         about: p.about || "",
         vertical: p.vertical || "",
@@ -471,9 +441,7 @@ function htmlPage(photoEnabled) {
       renderWebsites();
 
       if (state.current.profile_picture_url) {
-        var img = $("thumb");
-        img.style.visibility = "visible";
-        img.src = state.current.profile_picture_url;
+        var img = $("thumb"); img.style.visibility = "visible"; img.src = state.current.profile_picture_url;
       }
 
       $("editor").classList.remove("hidden");
@@ -481,23 +449,14 @@ function htmlPage(photoEnabled) {
       state.loaded = true;
 
       $("status").textContent = "Loaded.";
-      setTimeout(function(){ $("status").textContent=""; }, 1500);
+      setTimeout(function(){ $("status").textContent = ""; }, 1500);
     })
-    .catch(function(e){
-      toast($("status"), "Error: " + e.message, false);
-    });
-  }
+    .catch(function(e){ toast($("status"), "Error: " + e.message, false); });
+  };
 
-  function includeIfValue(v){
-    if (v === null || v === undefined) return false;
-    if (Array.isArray(v)) return v.length > 0;
-    if (typeof v === "string") return v.trim().length > 0;
-    return true;
-  }
-
+  function include(v){ if(v==null) return false; if(Array.isArray(v)) return v.length>0; if(typeof v==="string") return v.trim().length>0; return true; }
   function computeChanges(){
     if (!state.loaded) return { changes:{}, list:[] };
-
     var proposed = {
       about: $("about").value.trim(),
       description: $("description").value.trim(),
@@ -506,17 +465,13 @@ function htmlPage(photoEnabled) {
       vertical: $("vertical").value.trim(),
       websites: (state.websites || []).slice(0,2)
     };
-
-    var changes = {};
-    var list = [];
-
+    var changes = {}, list = [];
     ["about","description","address","email","vertical"].forEach(function(k){
-      if (includeIfValue(proposed[k]) && proposed[k] !== (state.current[k] || "")) {
+      if (include(proposed[k]) && proposed[k] !== (state.current[k] || "")) {
         changes[k] = proposed[k];
-        list.push({ key:k, old: (state.current[k] || "(empty)"), val: proposed[k] });
+        list.push({ key:k, old:(state.current[k] || "(empty)"), val: proposed[k] });
       }
     });
-
     if (Array.isArray(proposed.websites) && proposed.websites.length > 0) {
       var oldWs = (state.current.websites || []).join(", ");
       var newWs = proposed.websites.join(", ");
@@ -525,33 +480,18 @@ function htmlPage(photoEnabled) {
         list.push({ key:"websites", old: oldWs || "(empty)", val: newWs });
       }
     }
-
-    return { changes: changes, list: list };
+    return { changes, list };
   }
 
-  // Save click -> show modal only when there are changes
   $("btnSave").onclick = function(){
     if (!state.loaded) { toast($("saveMsg"), "Load profile first", false); return; }
     var res = computeChanges();
-
-    if (!res.list.length) {
-      toast($("saveMsg"), "No changes to update.", false);
-      return;
-    }
-
-    pendingPayload = res.changes;
-    openConfirm(res.list);
+    if (!res.list.length) { toast($("saveMsg"), "No changes to update.", false); return; }
+    pendingPayload = res.changes; openConfirm(res.list);
   };
-
-  // Confirm / Cancel wired once
-  $("mCancel").onclick = function(){
-    pendingPayload = null;
-    closeConfirm();
-  };
-
+  $("mCancel").onclick = function(){ pendingPayload = null; closeConfirm(); };
   $("mConfirm").onclick = function(){
     if (!pendingPayload) { closeConfirm(); return; }
-
     fetch("/api/profile", {
       method: "POST",
       headers: {
@@ -561,12 +501,12 @@ function htmlPage(photoEnabled) {
       },
       body: JSON.stringify(pendingPayload)
     })
-    .then(function(resp){ return resp.json().then(function(out){ return {resp:resp, out:out}; }); })
+    .then(function(r){ return r.json().then(function(o){ return {r:r,o:o}; }); })
     .then(function(pair){
       closeConfirm();
-      var resp = pair.resp, out = pair.out;
-      if (!resp.ok) {
-        var msg = (out && out.data && out.data.error && out.data.error.message) || (out && out.error) || "Update failed";
+      var r = pair.r, o = pair.o;
+      if (!r.ok) {
+        var msg = (o && o.data && o.data.error && o.data.error.message) || (o && o.error) || "Update failed";
         toast($("saveMsg"), msg, false);
         return;
       }
@@ -574,14 +514,11 @@ function htmlPage(photoEnabled) {
       Object.assign(state.current, pendingPayload);
       pendingPayload = null;
     })
-    .catch(function(e){
-      closeConfirm();
-      toast($("saveMsg"), "Error: " + e.message, false);
-    });
+    .catch(function(e){ closeConfirm(); toast($("saveMsg"), "Error: " + e.message, false); });
   };
 
   // Photo upload
-  var btnPhoto = document.getElementById("btnPhoto");
+  var btnPhoto = $("btnPhoto");
   if (btnPhoto) {
     btnPhoto.addEventListener("click", function(){
       if (!state.loaded) { toast($("photoMsg"), "Load profile first", false); return; }
@@ -613,28 +550,21 @@ function htmlPage(photoEnabled) {
         return;
       }
 
-      req.then(function(resp){ return resp.json().then(function(out){ return {resp:resp, out:out}; }); })
+      req.then(function(r){ return r.json().then(function(o){ return {r:r,o:o}; }); })
         .then(function(pair){
-          var resp = pair.resp, out = pair.out;
-          if (!resp.ok) {
-            var emsg = (out && out.error) ? (typeof out.error === "string" ? out.error : JSON.stringify(out.error)) : "Photo update failed";
+          var r = pair.r, o = pair.o;
+          if (!r.ok) {
+            var emsg = (o && o.error) ? (typeof o.error === "string" ? o.error : JSON.stringify(o.error)) : "Photo update failed";
             toast($("photoMsg"), emsg, false);
             return;
           }
           toast($("photoMsg"), "Photo updated ✓", true);
         })
-        .catch(function(e){
-          toast($("photoMsg"), "Error: " + e.message, false);
-        });
+        .catch(function(e){ toast($("photoMsg"), "Error: " + e.message, false); });
     });
-  }
-
-  function escapeHtml(s){
-    return String(s).replace(/[&<>\"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]); });
   }
 })();
 </script>
 </body>
-</html>`
-  );
+</html>`;
 }
