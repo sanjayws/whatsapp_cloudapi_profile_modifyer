@@ -1,7 +1,7 @@
 # WhatsApp Business Profile Manager (Cloudflare Worker)
 
 A lightweight web interface to **view and update your WhatsApp Business Profile** using the WhatsApp Cloud API.  
-No database is required — all data is **ephemeral** and sent directly from your browser to the Meta Graph API via the Worker.
+No database is required — all data is **ephemeral** and sent directly from your browser to the Meta Graph API via the Cloudflare Worker.
 
 ---
 
@@ -19,6 +19,7 @@ No database is required — all data is **ephemeral** and sent directly from you
 - **Safe updates** — only sends changed fields to WhatsApp
 - Confirmation dialog showing exactly which fields will be updated
 - Cancel and return to edit if needed
+- Prevents editing until profile data is loaded
 - Clean, light, responsive UI in a boxed layout
 - No backend storage of tokens or profile data
 
@@ -26,43 +27,43 @@ No database is required — all data is **ephemeral** and sent directly from you
 
 ## 📸 Demo
 
-![Screenshot of WhatsApp Business Profile Manager UI](docs/screenshot-ui.png)
+<img width="2012" height="1980" alt="image" src="https://github.com/user-attachments/assets/937a8e9b-524a-45f6-862a-c174c37d8c1d" />
 
 ---
 
-## 🚀 Deployment
+## 🔑 Credentials Explained
 
-### 1. Prerequisites
+This tool works with the [WhatsApp Business Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api/).
 
-- [Cloudflare Workers account](https://dash.cloudflare.com/)
-- [Meta developer account](https://developers.facebook.com/)
-- WhatsApp Business Cloud API **Phone Number ID** and **Permanent Access Token**
+You will need:
 
----
+| Name                | Required? | Description                                                                                  | Where to Find                                                                                                   |
+|---------------------|-----------|----------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| **Phone Number ID** | ✅         | Unique ID for your WhatsApp Business phone number                                           | Meta Developer Dashboard → Your App → WhatsApp → API Setup                                                      |
+| **Access Token**    | ✅         | Permanent access token (recommended) for calling the Cloud API                              | Meta Developer Dashboard → Your App → WhatsApp → API Setup → "Permanent token" section                          |
+| **App ID**          | ❌ (for profile update) | Meta App ID. Not required for viewing/updating profile fields in this tool. Needed only for certain endpoints like media uploads using App-scoped IDs. | Meta Developer Dashboard → Your App → App Settings → Basic Information                                          |
 
-### 2. Get Your WhatsApp Credentials
-
-1. Go to [Meta Developer Dashboard](https://developers.facebook.com/apps/)
-2. Select your app > **WhatsApp** > **API Setup**
-3. Copy:
-   - **Phone Number ID**
-   - **Permanent Access Token** (not a temporary token)
+**For this tool**, you only need:
+- `PHONE_NUMBER_ID`
+- `ACCESS_TOKEN`
 
 ---
 
-### 3. Deploy to Cloudflare
+## ☁️ Cloudflare Setup
 
-**Option A — Using Wrangler CLI**
-```bash
-# Install Wrangler CLI
-npm install -g wrangler
+You can use this tool in two ways:
 
-# Login to Cloudflare
-wrangler login
+### **Option 1: Enter credentials in the UI (ephemeral, no storage)**
+- Visit your deployed Worker URL
+- Enter your **Phone Number ID** and **Access Token** each time
+- Credentials are kept in memory only for that session
 
-# Clone this repo
-git clone https://github.com/YOUR_USERNAME/wa-business-profile-manager.git
-cd wa-business-profile-manager
-
-# Publish the Worker
-wrangler publish
+### **Option 2: Store credentials in Cloudflare Worker environment variables**
+1. In Cloudflare Dashboard → Your Worker → **Settings** → **Variables**
+2. Add:
+   - `WA_PHONE_NUMBER_ID` → your Phone Number ID
+   - `WA_ACCESS_TOKEN` → your Permanent Access Token
+3. Modify `worker.js` to use these variables:
+   ```js
+   const PHONE_NUMBER_ID = WA_PHONE_NUMBER_ID; // from Cloudflare env
+   const ACCESS_TOKEN = WA_ACCESS_TOKEN;       // from Cloudflare env
